@@ -7,10 +7,6 @@ import (
 )
 
 const (
-	// WorkflowControllerConfigMapKey is the key in the configmap to retrieve workflow configuration from.
-	// Content encoding is expected to be YAML.
-	WorkflowControllerConfigMapKey = "config"
-
 	// DefaultArchivePattern is the default pattern when storing artifacts in an archive repository
 	DefaultArchivePattern = "{{workflow.name}}/{{pod.name}}"
 
@@ -34,6 +30,8 @@ const (
 
 	// AnnotationKeyNodeName is the pod metadata annotation key containing the workflow node name
 	AnnotationKeyNodeName = workflow.WorkflowFullName + "/node-name"
+	// AnnotationKeyNodeName is the node's type
+	AnnotationKeyNodeType = workflow.WorkflowFullName + "/node-type"
 
 	// AnnotationKeyNodeMessage is the pod metadata annotation key the executor will use to
 	// communicate errors encountered by the executor during artifact load/save, etc...
@@ -57,6 +55,14 @@ const (
 	LabelKeyWorkflow = workflow.WorkflowFullName + "/workflow"
 	// LabelKeyPhase is a label applied to workflows to indicate the current phase of the workflow (for filtering purposes)
 	LabelKeyPhase = workflow.WorkflowFullName + "/phase"
+	// LabelKeyCronWorkflow is a label applied to Workflows that are started by a CronWorkflow
+	LabelKeyCronWorkflow = workflow.WorkflowFullName + "/cron-workflow"
+	// LabelKeyWorkflowTemplate is a label applied to Workflows that are submitted from Workflowtemplate
+	LabelKeyWorkflowTemplate = workflow.WorkflowFullName + "/workflow-template"
+	// LabelKeyWorkflowTemplate is a label applied to Workflows that are submitted from ClusterWorkflowtemplate
+	LabelKeyClusterWorkflowTemplate = workflow.WorkflowFullName + "/cluster-workflow-template"
+	// LabelKeyOnExit is a label applied to Pods that are run from onExit nodes, so that they are not shut down when stopping a Workflow
+	LabelKeyOnExit = workflow.WorkflowFullName + "/on-exit"
 
 	// ExecutorArtifactBaseDir is the base directory in the init container in which artifacts will be copied to.
 	// Each artifact will be named according to its input name (e.g: /argo/inputs/artifacts/CODE)
@@ -87,6 +93,8 @@ const (
 	EnvVarKubeletPort = "ARGO_KUBELET_PORT"
 	// EnvVarKubeletInsecure is used to disable the TLS verification
 	EnvVarKubeletInsecure = "ARGO_KUBELET_INSECURE"
+	// EnvVarArgoTrace is used enable tracing statements in Argo components
+	EnvVarArgoTrace = "ARGO_TRACE"
 
 	// ContainerRuntimeExecutorDocker to use docker as container runtime executor
 	ContainerRuntimeExecutorDocker = "docker"
@@ -106,6 +114,8 @@ const (
 	GlobalVarWorkflowName = "workflow.name"
 	// GlobalVarWorkflowNamespace is a global workflow variable referencing the workflow's metadata.namespace field
 	GlobalVarWorkflowNamespace = "workflow.namespace"
+	// GlobalVarWorkflowServiceAccountName is a global workflow variable referencing the workflow's spec.serviceAccountName field
+	GlobalVarWorkflowServiceAccountName = "workflow.serviceAccountName"
 	// GlobalVarWorkflowUID is a global workflow variable referencing the workflow's metadata.uid field
 	GlobalVarWorkflowUID = "workflow.uid"
 	// GlobalVarWorkflowStatus is a global workflow variable referencing the workflow's status.phase field
@@ -114,6 +124,12 @@ const (
 	GlobalVarWorkflowCreationTimestamp = "workflow.creationTimestamp"
 	// GlobalVarWorkflowPriority is the workflow variable referencing the workflow's priority field
 	GlobalVarWorkflowPriority = "workflow.priority"
+	// GlobalVarWorkflowFailures is a global variable of a JSON map referencing the workflow's failed nodes
+	GlobalVarWorkflowFailures = "workflow.failures"
+	// GlobalVarWorkflowDuration is the current duration of this workflow
+	GlobalVarWorkflowDuration = "workflow.duration"
+	// GlobalVarWorkflowParameters is a JSON string containing all workflow parameters
+	GlobalVarWorkflowParameters = "workflow.parameters"
 	// LocalVarPodName is a step level variable that references the name of the pod
 	LocalVarPodName = "pod.name"
 
@@ -135,11 +151,4 @@ type ExecutionControl struct {
 	Deadline *time.Time `json:"deadline,omitempty"`
 	// IncludeScriptOutput is containing flag to include script output
 	IncludeScriptOutput bool `json:"includeScriptOutput,omitempty"`
-}
-
-type ResourceInterface interface {
-	GetNamespace() string
-	GetSecrets(namespace, name, key string) ([]byte, error)
-	GetSecretFromVolMount(name, key string) ([]byte, error)
-	GetConfigMapKey(namespace, name, key string) (string, error)
 }

@@ -3,11 +3,15 @@ package commands
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
-	cmdutil "github.com/argoproj/argo/util/cmd"
+	"github.com/argoproj/pkg/errors"
+
+	"github.com/argoproj/argo/cmd/argo/commands/client"
+	workflowpkg "github.com/argoproj/argo/pkg/apiclient/workflow"
 	"github.com/argoproj/argo/workflow/validate"
 )
 
@@ -16,50 +20,64 @@ func NewLintCommand() *cobra.Command {
 		strict bool
 	)
 	var command = &cobra.Command{
-		Use:   "lint (DIRECTORY | FILE1 FILE2 FILE3...)",
-		Short: "validate a file or directory of workflow manifests",
+		Use:   "lint FILE...",
+		Short: "validate files or directories of workflow manifests",
 		Run: func(cmd *cobra.Command, args []string) {
-			if len(args) == 0 {
-				cmd.HelpFunc()(cmd, args)
-				os.Exit(1)
-			}
+			ctx, apiClient := client.NewAPIClient()
+			serviceClient := apiClient.NewWorkflowServiceClient()
+			namespace := client.Namespace()
 
-			namespace, _, err := clientConfig.Namespace()
-			if err != nil {
-				log.Fatal(err)
-			}
-
-			_ = InitWorkflowClient()
-			validateDir := cmdutil.MustIsDir(args[0])
-			if validateDir {
-				if len(args) > 1 {
-					fmt.Printf("Validation of a single directory supported")
-					os.Exit(1)
+			lint := func(file string) error {
+				wfs, err := validate.ParseWfFromFile(file, strict)
+				if err != nil {
+					return err
 				}
-				fmt.Printf("Verifying all workflow manifests in directory: %s\n", args[0])
-				err = validate.LintWorkflowDir(wfClientset, namespace, args[0], strict)
-			} else {
-				yamlFiles := make([]string, 0)
-				for _, filePath := range args {
-					if cmdutil.MustIsDir(filePath) {
-						fmt.Printf("Validate against a list of files or a single directory, not both")
-						os.Exit(1)
-					}
-					yamlFiles = append(yamlFiles, filePath)
-				}
-				for _, yamlFile := range yamlFiles {
-					err = validate.LintWorkflowFile(wfClientset, namespace, yamlFile, strict)
+				for _, wf := range wfs {
+					_, err := serviceClient.LintWorkflow(ctx, &workflowpkg.WorkflowLintRequest{Namespace: namespace, Workflow: &wf})
 					if err != nil {
-						break
+						return err
+					}
+				}
+				fmt.Printf("%s is valid\n", file)
+				return nil
+			}
+
+			var invalidWfErr error
+			for _, file := range args {
+				stat, err := os.Stat(file)
+				errors.CheckError(err)
+				if stat.IsDir() {
+					_ = filepath.Walk(file, func(path string, info os.FileInfo, err error) error {
+						// If there was an error with the walk, return
+						if err != nil {
+							return err
+						}
+
+						fileExt := filepath.Ext(info.Name())
+						switch fileExt {
+						case ".yaml", ".yml", ".json":
+						default:
+							return nil
+						}
+						err = lint(path)
+						if err != nil {
+							invalidWfErr = fmt.Errorf("Invalid workflow/workflows found")
+							log.Warn(err)
+						}
+						return nil
+					})
+				} else {
+					err := lint(file)
+					if err != nil {
+						invalidWfErr = fmt.Errorf("Invalid workflow/workflows found")
+						log.Warn(err)
 					}
 				}
 			}
-			if err != nil {
-				log.Fatal(err)
-			}
+			errors.CheckError(invalidWfErr)
 			fmt.Printf("Workflow manifests validated\n")
 		},
 	}
-	command.Flags().BoolVar(&strict, "strict", true, "perform strict workflow validatation")
+	command.Flags().BoolVar(&strict, "strict", true, "perform strict workflow validation")
 	return command
 }

@@ -28,32 +28,35 @@ func waitContainer() error {
 	defer stats.LogStats()
 	stats.StartStatsTicker(5 * time.Minute)
 
+	defer func() {
+		// Killing sidecar containers
+		err := wfExecutor.KillSidecars()
+		if err != nil {
+			log.Errorf("Failed to kill sidecars: %s", err.Error())
+		}
+	}()
+
 	// Wait for main container to complete
-	err := wfExecutor.Wait()
-	if err != nil {
-		wfExecutor.AddError(err)
+	waitErr := wfExecutor.Wait()
+	if waitErr != nil {
+		wfExecutor.AddError(waitErr)
 		// do not return here so we can still try to kill sidecars & save outputs
 	}
+
 	// Saving logs
 	logArt, err := wfExecutor.SaveLogs()
 	if err != nil {
 		wfExecutor.AddError(err)
-		// do not return here so we can still try to kill sidecars
+		return err
 	}
 	// Saving output parameters
 	err = wfExecutor.SaveParameters()
 	if err != nil {
 		wfExecutor.AddError(err)
-		// do not return here so we can still try to kill sidecars
+		return err
 	}
 	// Saving output artifacts
 	err = wfExecutor.SaveArtifacts()
-	if err != nil {
-		wfExecutor.AddError(err)
-		// do not return here so we can still try to kill sidecars
-	}
-	// Killing sidecar containers
-	err = wfExecutor.KillSidecars()
 	if err != nil {
 		wfExecutor.AddError(err)
 		return err
@@ -64,10 +67,22 @@ func waitContainer() error {
 		wfExecutor.AddError(err)
 		return err
 	}
+	// Capture output script exit code
+	err = wfExecutor.CaptureScriptExitCode()
+	if err != nil {
+		wfExecutor.AddError(err)
+		return err
+	}
 	err = wfExecutor.AnnotateOutputs(logArt)
 	if err != nil {
 		wfExecutor.AddError(err)
 		return err
 	}
+
+	// To prevent the workflow step from completing successfully, return the error occurred during wait.
+	if waitErr != nil {
+		return waitErr
+	}
+
 	return nil
 }

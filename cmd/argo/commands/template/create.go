@@ -7,10 +7,11 @@ import (
 	"github.com/argoproj/pkg/json"
 	"github.com/spf13/cobra"
 
+	"github.com/argoproj/argo/cmd/argo/commands/client"
+	workflowtemplatepkg "github.com/argoproj/argo/pkg/apiclient/workflowtemplate"
 	wfv1 "github.com/argoproj/argo/pkg/apis/workflow/v1alpha1"
 	"github.com/argoproj/argo/workflow/common"
 	"github.com/argoproj/argo/workflow/util"
-	"github.com/argoproj/argo/workflow/validate"
 )
 
 type cliCreateOpts struct {
@@ -43,7 +44,9 @@ func CreateWorkflowTemplates(filePaths []string, cliOpts *cliCreateOpts) {
 	if cliOpts == nil {
 		cliOpts = &cliCreateOpts{}
 	}
-	defaultWFTmplClient := InitWorkflowTemplateClient()
+	ctx, apiClient := client.NewAPIClient()
+	serviceClient := apiClient.NewWorkflowTemplateServiceClient()
+	namespace := client.Namespace()
 
 	fileContents, err := util.ReadManifest(filePaths...)
 	if err != nil {
@@ -57,20 +60,15 @@ func CreateWorkflowTemplates(filePaths []string, cliOpts *cliCreateOpts) {
 	}
 
 	if len(workflowTemplates) == 0 {
-		log.Println("No WorkflowTemplate found in given files")
+		log.Println("No workflow template found in given files")
 		os.Exit(1)
 	}
 
 	for _, wftmpl := range workflowTemplates {
-		err := validate.ValidateWorkflowTemplate(wfClientset, namespace, &wftmpl)
-		if err != nil {
-			log.Fatalf("Failed to create workflow template: %v", err)
-		}
-		wftmplClient := defaultWFTmplClient
-		if wftmpl.Namespace != "" {
-			wftmplClient = InitWorkflowTemplateClient(wftmpl.Namespace)
-		}
-		created, err := wftmplClient.Create(&wftmpl)
+		created, err := serviceClient.CreateWorkflowTemplate(ctx, &workflowtemplatepkg.WorkflowTemplateCreateRequest{
+			Namespace: namespace,
+			Template:  &wftmpl,
+		})
 		if err != nil {
 			log.Fatalf("Failed to create workflow template: %v", err)
 		}

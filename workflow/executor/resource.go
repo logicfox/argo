@@ -10,52 +10,25 @@ import (
 	"strings"
 	"time"
 
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-
-	"github.com/argoproj/argo/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
+
+	"github.com/argoproj/argo/errors"
 )
 
 // ExecResource will run kubectl action against a manifest
-func (we *WorkflowExecutor) ExecResource(action string, manifestPath string) (string, string, error) {
-	isDelete := action == "delete"
-	args := []string{
-		action,
-	}
-	output := "json"
-	if isDelete {
-		args = append(args, "--ignore-not-found")
-		output = "name"
+func (we *WorkflowExecutor) ExecResource(action string, manifestPath string, flags []string) (string, string, error) {
+	args, err := we.getKubectlArguments(action, manifestPath, flags)
+	if err != nil {
+		return "", "", err
 	}
 
-	if action == "patch" {
-		mergeStrategy := "strategic"
-		if we.Template.Resource.MergeStrategy != "" {
-			mergeStrategy = we.Template.Resource.MergeStrategy
-		}
-
-		args = append(args, "--type")
-		args = append(args, mergeStrategy)
-
-		args = append(args, "-p")
-		buff, err := ioutil.ReadFile(manifestPath)
-
-		if err != nil {
-			return "", "", errors.New(errors.CodeBadRequest, err.Error())
-		}
-
-		args = append(args, string(buff))
-	}
-
-	args = append(args, "-f")
-	args = append(args, manifestPath)
-	args = append(args, "-o")
-	args = append(args, output)
 	cmd := exec.Command("kubectl", args...)
 	log.Info(strings.Join(cmd.Args, " "))
+
 	out, err := cmd.Output()
 	if err != nil {
 		exErr := err.(*exec.ExitError)
@@ -73,6 +46,51 @@ func (we *WorkflowExecutor) ExecResource(action string, manifestPath string) (st
 	resourceName := fmt.Sprintf("%s.%s/%s", obj.GroupVersionKind().Kind, obj.GroupVersionKind().Group, obj.GetName())
 	log.Infof("%s/%s", obj.GetNamespace(), resourceName)
 	return obj.GetNamespace(), resourceName, nil
+}
+
+func (we *WorkflowExecutor) getKubectlArguments(action string, manifestPath string, flags []string) ([]string, error) {
+	args := []string{
+		action,
+	}
+	output := "json"
+
+	if action == "delete" {
+		args = append(args, "--ignore-not-found")
+		output = "name"
+	}
+
+	buff, err := ioutil.ReadFile(manifestPath)
+	if err != nil {
+		return []string{}, errors.New(errors.CodeBadRequest, err.Error())
+	}
+
+	if action == "patch" {
+		mergeStrategy := "strategic"
+		if we.Template.Resource.MergeStrategy != "" {
+			mergeStrategy = we.Template.Resource.MergeStrategy
+		}
+
+		args = append(args, "--type")
+		args = append(args, mergeStrategy)
+
+		args = append(args, "-p")
+		args = append(args, string(buff))
+	}
+
+	if len(flags) != 0 {
+		args = append(args, flags...)
+	}
+
+	if len(buff) != 0 {
+		args = append(args, "-f")
+		args = append(args, manifestPath)
+	} else if len(flags) <= 0 {
+		return []string{}, errors.New(errors.CodeBadRequest, "Must provide at least one of flags or manifest.")
+	}
+	args = append(args, "-o")
+	args = append(args, output)
+
+	return args, nil
 }
 
 // gjsonLabels is an implementation of labels.Labels interface
@@ -143,9 +161,29 @@ func (we *WorkflowExecutor) WaitResource(resourceNamespace string, resourceName 
 		} else {
 			log.Warnf("Waiting for resource %s resulted in error %v", resourceName, err)
 		}
+		return err
 	}
 
-	return err
+	return nil
+}
+
+func checkIfResourceDeleted(resourceName string, resourceNamespace string) bool {
+	args := []string{"get", resourceName}
+	if resourceNamespace != "" {
+		args = append(args, "-n", resourceNamespace)
+	}
+	cmd := exec.Command("kubectl", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		if strings.Contains(stderr.String(), "NotFound") {
+			return true
+		}
+		log.Warnf("Got error %v when checking if the resource %s in namespace %s is deleted", err, resourceName, resourceNamespace)
+		return false
+	}
+	return false
 }
 
 // Function to do the kubectl get -w command and then waiting on json reading.
@@ -185,6 +223,10 @@ func checkResourceState(resourceNamespace string, resourceName string, successRe
 				log.Infof("readJSon failed for resource %s but cmd.Wait for kubectl get -w command did not error", resourceName)
 			}
 			return true, resultErr
+		}
+
+		if checkIfResourceDeleted(resourceName, resourceNamespace) {
+			return false, errors.Errorf(errors.CodeNotFound, "Resource %s in namespace %s has been deleted somehow.", resourceName, resourceNamespace)
 		}
 
 		log.Info(string(jsonBytes))
@@ -285,10 +327,15 @@ func (we *WorkflowExecutor) SaveResourceParameters(resourceNamespace string, res
 		log.Info(cmd.Args)
 		out, err := cmd.Output()
 		if err != nil {
-			if exErr, ok := err.(*exec.ExitError); ok {
-				log.Errorf("`%s` stderr:\n%s", cmd.Args, string(exErr.Stderr))
+			// We have a default value to use instead of returning an error
+			if param.ValueFrom.Default != nil {
+				out = []byte(*param.ValueFrom.Default)
+			} else {
+				if exErr, ok := err.(*exec.ExitError); ok {
+					log.Errorf("`%s` stderr:\n%s", cmd.Args, string(exErr.Stderr))
+				}
+				return errors.InternalWrapError(err)
 			}
-			return errors.InternalWrapError(err)
 		}
 		output := string(out)
 		we.Template.Outputs.Parameters[i].Value = &output

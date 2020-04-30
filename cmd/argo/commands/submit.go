@@ -3,19 +3,22 @@ package commands
 import (
 	"log"
 	"os"
-	"strconv"
+	"strings"
 
-	"github.com/argoproj/pkg/json"
 	"github.com/spf13/cobra"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	apimachineryversion "k8s.io/apimachinery/pkg/version"
+	"github.com/argoproj/pkg/errors"
+	argoJson "github.com/argoproj/pkg/json"
 
+	"github.com/argoproj/argo/cmd/argo/commands/client"
+	workflowpkg "github.com/argoproj/argo/pkg/apiclient/workflow"
 	wfv1 "github.com/argoproj/argo/pkg/apis/workflow/v1alpha1"
 	"github.com/argoproj/argo/workflow/common"
 	"github.com/argoproj/argo/workflow/util"
 )
 
-// cliSubmitOpts holds submition options specific to CLI submission (e.g. controlling output)
+// cliSubmitOpts holds submission options specific to CLI submission (e.g. controlling output)
 type cliSubmitOpts struct {
 	output   string // --output
 	wait     bool   // --wait
@@ -26,23 +29,36 @@ type cliSubmitOpts struct {
 
 func NewSubmitCommand() *cobra.Command {
 	var (
-		submitOpts    util.SubmitOpts
+		submitOpts    wfv1.SubmitOpts
 		cliSubmitOpts cliSubmitOpts
 		priority      int32
+		from          string
 	)
 	var command = &cobra.Command{
-		Use:   "submit FILE1 FILE2...",
+		Use:   "submit [FILE... | --from `kind/name]",
 		Short: "submit a workflow",
+		Example: `# Submit multiple workflows from files:
+
+  argo submit my-wf.yaml
+
+# Submit a single workflow from an existing resource
+
+  argo submit --from cronwf/my-cron-wf
+`,
 		Run: func(cmd *cobra.Command, args []string) {
-			if len(args) == 0 {
-				cmd.HelpFunc()(cmd, args)
-				os.Exit(1)
-			}
 			if cmd.Flag("priority").Changed {
 				cliSubmitOpts.priority = &priority
 			}
 
-			SubmitWorkflows(args, &submitOpts, &cliSubmitOpts)
+			if from != "" {
+				if len(args) != 0 {
+					cmd.HelpFunc()(cmd, args)
+					os.Exit(1)
+				}
+				submitWorkflowFromResource(from, &submitOpts, &cliSubmitOpts)
+			} else {
+				submitWorkflowsFromFile(args, &submitOpts, &cliSubmitOpts)
+			}
 		},
 	}
 	command.Flags().StringVar(&submitOpts.Name, "name", "", "override metadata.name")
@@ -60,28 +76,18 @@ func NewSubmitCommand() *cobra.Command {
 	command.Flags().Int32Var(&priority, "priority", 0, "workflow priority")
 	command.Flags().StringVarP(&submitOpts.ParameterFile, "parameter-file", "f", "", "pass a file containing all input parameters")
 	command.Flags().StringVarP(&submitOpts.Labels, "labels", "l", "", "Comma separated labels to apply to the workflow. Will override previous values.")
+	command.Flags().StringVar(&from, "from", "", "Submit from an existing `kind/name` E.g., --from=cronwf/hello-world-cwf")
 	// Only complete files with appropriate extension.
 	err := command.Flags().SetAnnotation("parameter-file", cobra.BashCompFilenameExt, []string{"json", "yaml", "yml"})
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	return command
 }
 
-func SubmitWorkflows(filePaths []string, submitOpts *util.SubmitOpts, cliOpts *cliSubmitOpts) {
-	if submitOpts == nil {
-		submitOpts = &util.SubmitOpts{}
-	}
-	if cliOpts == nil {
-		cliOpts = &cliSubmitOpts{}
-	}
-	defaultWFClient := InitWorkflowClient()
-
+func submitWorkflowsFromFile(filePaths []string, submitOpts *wfv1.SubmitOpts, cliOpts *cliSubmitOpts) {
 	fileContents, err := util.ReadManifest(filePaths...)
-	if err != nil {
-		log.Fatal(err)
-	}
+	errors.CheckError(err)
 
 	var workflows []wfv1.Workflow
 	for _, body := range fileContents {
@@ -89,6 +95,10 @@ func SubmitWorkflows(filePaths []string, submitOpts *util.SubmitOpts, cliOpts *c
 		workflows = append(workflows, wfs...)
 	}
 
+	submitWorkflows(workflows, submitOpts, cliOpts)
+}
+
+func validateOptions(workflows []wfv1.Workflow, submitOpts *wfv1.SubmitOpts, cliOpts *cliSubmitOpts) {
 	if cliOpts.watch {
 		if len(workflows) > 1 {
 			log.Fatalf("Cannot watch more than one workflow")
@@ -126,18 +136,45 @@ func SubmitWorkflows(filePaths []string, submitOpts *util.SubmitOpts, cliOpts *c
 		if cliOpts.output == "" {
 			log.Fatalf("--server-dry-run should have an output option")
 		}
-		serverVersion, err := wfClientset.Discovery().ServerVersion()
-		if err != nil {
-			log.Fatalf("Unexpected error while getting the server's api version")
-		}
-		isCompatible, err := checkServerVersionForDryRun(serverVersion)
-		if err != nil {
-			log.Fatalf("Unexpected error while checking the server's api version compatibility with --server-dry-run")
-		}
-		if !isCompatible {
-			log.Fatalf("--server-dry-run is not available for server api versions older than v1.12")
-		}
 	}
+}
+
+func submitWorkflowFromResource(resourceIdentifier string, submitOpts *wfv1.SubmitOpts, cliOpts *cliSubmitOpts) {
+
+	parts := strings.SplitN(resourceIdentifier, "/", 2)
+	if len(parts) != 2 {
+		log.Fatalf("resource identifier '%s' is malformed. Should be `kind/name`, e.g. cronwf/hello-world-cwf", resourceIdentifier)
+	}
+	kind := parts[0]
+	name := parts[1]
+
+	ctx, apiClient := client.NewAPIClient()
+	namespace := client.Namespace()
+	tempwf := wfv1.Workflow{}
+
+	validateOptions([]wfv1.Workflow{tempwf}, submitOpts, cliOpts)
+
+	created, err := apiClient.NewWorkflowServiceClient().SubmitWorkflow(ctx, &workflowpkg.WorkflowSubmitRequest{
+		Namespace:     namespace,
+		ResourceKind:  kind,
+		ResourceName:  name,
+		SubmitOptions: submitOpts,
+	})
+	if err != nil {
+		log.Fatalf("Failed to submit workflow: %v", err)
+	}
+	printWorkflow(created, cliOpts.output, DefaultStatus)
+
+	waitOrWatch([]string{created.Name}, *cliOpts)
+}
+
+func submitWorkflows(workflows []wfv1.Workflow, submitOpts *wfv1.SubmitOpts, cliOpts *cliSubmitOpts) {
+
+	ctx, apiClient := client.NewAPIClient()
+	serviceClient := apiClient.NewWorkflowServiceClient()
+	namespace := client.Namespace()
+
+	validateOptions(workflows, submitOpts, cliOpts)
 
 	if len(workflows) == 0 {
 		log.Println("No Workflow found in given files")
@@ -147,54 +184,42 @@ func SubmitWorkflows(filePaths []string, submitOpts *util.SubmitOpts, cliOpts *c
 	var workflowNames []string
 
 	for _, wf := range workflows {
-		wf.Spec.Priority = cliOpts.priority
-		wfClient := defaultWFClient
-		if wf.Namespace != "" {
-			wfClient = InitWorkflowClient(wf.Namespace)
-		} else {
+		if wf.Namespace == "" {
 			// This is here to avoid passing an empty namespace when using --server-dry-run
-			namespace, _, err := clientConfig.Namespace()
-			if err != nil {
-				log.Fatal(err)
-			}
 			wf.Namespace = namespace
 		}
-		created, err := util.SubmitWorkflow(wfClient, wfClientset, namespace, &wf, submitOpts)
+		err := util.ApplySubmitOpts(&wf, submitOpts)
+		errors.CheckError(err)
+		wf.Spec.Priority = cliOpts.priority
+		options := &metav1.CreateOptions{}
+		if submitOpts.DryRun {
+			options.DryRun = []string{"All"}
+		}
+		created, err := serviceClient.CreateWorkflow(ctx, &workflowpkg.WorkflowCreateRequest{
+			Namespace:     wf.Namespace,
+			Workflow:      &wf,
+			InstanceID:    submitOpts.InstanceID,
+			ServerDryRun:  submitOpts.ServerDryRun,
+			CreateOptions: options,
+		})
 		if err != nil {
 			log.Fatalf("Failed to submit workflow: %v", err)
 		}
 		printWorkflow(created, cliOpts.output, DefaultStatus)
 		workflowNames = append(workflowNames, created.Name)
 	}
-	waitOrWatch(workflowNames, *cliOpts)
-}
 
-// Checks whether the server has support for the dry-run option
-func checkServerVersionForDryRun(serverVersion *apimachineryversion.Info) (bool, error) {
-	majorVersion, err := strconv.Atoi(serverVersion.Major)
-	if err != nil {
-		return false, err
-	}
-	minorVersion, err := strconv.Atoi(serverVersion.Minor)
-	if err != nil {
-		return false, err
-	}
-	if majorVersion < 1 {
-		return false, nil
-	} else if majorVersion == 1 && minorVersion < 12 {
-		return false, nil
-	}
-	return true, nil
+	waitOrWatch(workflowNames, *cliOpts)
 }
 
 // unmarshalWorkflows unmarshals the input bytes as either json or yaml
 func unmarshalWorkflows(wfBytes []byte, strict bool) []wfv1.Workflow {
 	var wf wfv1.Workflow
-	var jsonOpts []json.JSONOpt
+	var jsonOpts []argoJson.JSONOpt
 	if strict {
-		jsonOpts = append(jsonOpts, json.DisallowUnknownFields)
+		jsonOpts = append(jsonOpts, argoJson.DisallowUnknownFields)
 	}
-	err := json.Unmarshal(wfBytes, &wf, jsonOpts...)
+	err := argoJson.Unmarshal(wfBytes, &wf, jsonOpts...)
 	if err == nil {
 		return []wfv1.Workflow{wf}
 	}

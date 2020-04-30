@@ -3,22 +3,24 @@ package commands
 import (
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
 
+	"github.com/argoproj/pkg/errors"
 	"github.com/argoproj/pkg/humanize"
 	argotime "github.com/argoproj/pkg/time"
 	"github.com/spf13/cobra"
-	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
 
+	"github.com/argoproj/argo/cmd/argo/commands/client"
+	workflowpkg "github.com/argoproj/argo/pkg/apiclient/workflow"
 	wfv1 "github.com/argoproj/argo/pkg/apis/workflow/v1alpha1"
-	"github.com/argoproj/argo/pkg/client/clientset/versioned/typed/workflow/v1alpha1"
 	"github.com/argoproj/argo/workflow/common"
 	"github.com/argoproj/argo/workflow/util"
 )
@@ -28,9 +30,11 @@ type listFlags struct {
 	status        []string // --status
 	completed     bool     // --completed
 	running       bool     // --running
+	prefix        string   // --prefix
 	output        string   // --output
 	since         string   // --since
 	chunkSize     int64    // --chunk-size
+	noHeaders     bool     // --no-headers
 }
 
 func NewListCommand() *cobra.Command {
@@ -41,12 +45,7 @@ func NewListCommand() *cobra.Command {
 		Use:   "list",
 		Short: "list workflows",
 		Run: func(cmd *cobra.Command, args []string) {
-			var wfClient v1alpha1.WorkflowInterface
-			if listArgs.allNamespaces {
-				wfClient = InitWorkflowClient(apiv1.NamespaceAll)
-			} else {
-				wfClient = InitWorkflowClient()
-			}
+
 			listOpts := metav1.ListOptions{}
 			labelSelector := labels.NewSelector()
 			if len(listArgs.status) != 0 {
@@ -64,40 +63,66 @@ func NewListCommand() *cobra.Command {
 				labelSelector = labelSelector.Add(*req)
 			}
 			listOpts.LabelSelector = labelSelector.String()
-			if listArgs.chunkSize != 0 {
-				listOpts.Limit = listArgs.chunkSize
+
+			ctx, apiClient := client.NewAPIClient()
+			serviceClient := apiClient.NewWorkflowServiceClient()
+			namespace := client.Namespace()
+			if listArgs.allNamespaces {
+				namespace = ""
 			}
-			wfList, err := wfClient.List(listOpts)
-			if err != nil {
-				log.Fatal(err)
-			}
+
+			wfList, err := serviceClient.ListWorkflows(ctx, &workflowpkg.WorkflowListRequest{
+				Namespace:   namespace,
+				ListOptions: &listOpts,
+			})
+			errors.CheckError(err)
 
 			tmpWorkFlows := wfList.Items
 			for wfList.ListMeta.Continue != "" {
 				listOpts.Continue = wfList.ListMeta.Continue
-				wfList, err = wfClient.List(listOpts)
+				wfList, err := serviceClient.ListWorkflows(ctx, &workflowpkg.WorkflowListRequest{
+					Namespace:   namespace,
+					ListOptions: &listOpts,
+				})
 				if err != nil {
 					log.Fatal(err)
 				}
 				tmpWorkFlows = append(tmpWorkFlows, wfList.Items...)
 			}
 
-			var workflows []wfv1.Workflow
-			if listArgs.since == "" {
-				workflows = tmpWorkFlows
+			var tmpWorkFlowsSelected []wfv1.Workflow
+			if listArgs.prefix == "" {
+				tmpWorkFlowsSelected = tmpWorkFlows
 			} else {
-				workflows = make([]wfv1.Workflow, 0)
+				tmpWorkFlowsSelected = make([]wfv1.Workflow, 0)
+				for _, wf := range tmpWorkFlows {
+					if strings.HasPrefix(wf.ObjectMeta.Name, listArgs.prefix) {
+						tmpWorkFlowsSelected = append(tmpWorkFlowsSelected, wf)
+					}
+				}
+			}
+
+			var workflows wfv1.Workflows
+			if listArgs.since == "" {
+				workflows = tmpWorkFlowsSelected
+			} else {
+				workflows = make(wfv1.Workflows, 0)
 				minTime, err := argotime.ParseSince(listArgs.since)
 				if err != nil {
 					log.Fatal(err)
 				}
-				for _, wf := range tmpWorkFlows {
+				for _, wf := range tmpWorkFlowsSelected {
 					if wf.Status.FinishedAt.IsZero() || wf.ObjectMeta.CreationTimestamp.After(*minTime) {
 						workflows = append(workflows, wf)
 					}
 				}
 			}
-			sort.Sort(ByFinishedAt(workflows))
+			sort.Sort(workflows)
+
+			if listArgs.chunkSize != 0 {
+				idx := int64(math.Min(float64(listArgs.chunkSize), float64(len(workflows))))
+				workflows = workflows[0:idx]
+			}
 
 			switch listArgs.output {
 			case "", "wide":
@@ -112,25 +137,29 @@ func NewListCommand() *cobra.Command {
 		},
 	}
 	command.Flags().BoolVar(&listArgs.allNamespaces, "all-namespaces", false, "Show workflows from all namespaces")
+	command.Flags().StringVar(&listArgs.prefix, "prefix", "", "Filter workflows by prefix")
 	command.Flags().StringSliceVar(&listArgs.status, "status", []string{}, "Filter by status (comma separated)")
 	command.Flags().BoolVar(&listArgs.completed, "completed", false, "Show only completed workflows")
 	command.Flags().BoolVar(&listArgs.running, "running", false, "Show only running workflows")
 	command.Flags().StringVarP(&listArgs.output, "output", "o", "", "Output format. One of: wide|name")
 	command.Flags().StringVar(&listArgs.since, "since", "", "Show only workflows newer than a relative duration")
 	command.Flags().Int64VarP(&listArgs.chunkSize, "chunk-size", "", 500, "Return large lists in chunks rather than all at once. Pass 0 to disable.")
+	command.Flags().BoolVar(&listArgs.noHeaders, "no-headers", false, "Don't print headers (default print headers).")
 	return command
 }
 
 func printTable(wfList []wfv1.Workflow, listArgs *listFlags) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	if listArgs.allNamespaces {
-		fmt.Fprint(w, "NAMESPACE\t")
+	if !listArgs.noHeaders {
+		if listArgs.allNamespaces {
+			fmt.Fprint(w, "NAMESPACE\t")
+		}
+		fmt.Fprint(w, "NAME\tSTATUS\tAGE\tDURATION\tPRIORITY")
+		if listArgs.output == "wide" {
+			fmt.Fprint(w, "\tP/R/C\tPARAMETERS")
+		}
+		fmt.Fprint(w, "\n")
 	}
-	fmt.Fprint(w, "NAME\tSTATUS\tAGE\tDURATION\tPRIORITY")
-	if listArgs.output == "wide" {
-		fmt.Fprint(w, "\tP/R/C\tPARAMETERS")
-	}
-	fmt.Fprint(w, "\n")
 	for _, wf := range wfList {
 		ageStr := humanize.RelativeDurationShort(wf.ObjectMeta.CreationTimestamp.Time, time.Now())
 		durationStr := humanize.RelativeDurationShort(wf.Status.StartedAt.Time, wf.Status.FinishedAt.Time)
@@ -156,10 +185,6 @@ func countPendingRunningCompleted(wf *wfv1.Workflow) (int, int, int) {
 	pending := 0
 	running := 0
 	completed := 0
-	err := util.DecompressWorkflow(wf)
-	if err != nil {
-		log.Fatal(err)
-	}
 	for _, node := range wf.Status.Nodes {
 		tmpl := wf.GetTemplateByName(node.TemplateName)
 		if tmpl == nil || !tmpl.IsPodType() {
@@ -199,28 +224,6 @@ func parameterString(params []wfv1.Parameter) string {
 	return strings.Join(pStrs, ",")
 }
 
-// ByFinishedAt is a sort interface which sorts running jobs earlier before considering FinishedAt
-type ByFinishedAt []wfv1.Workflow
-
-func (f ByFinishedAt) Len() int      { return len(f) }
-func (f ByFinishedAt) Swap(i, j int) { f[i], f[j] = f[j], f[i] }
-func (f ByFinishedAt) Less(i, j int) bool {
-	iStart := f[i].ObjectMeta.CreationTimestamp
-	iFinish := f[i].Status.FinishedAt
-	jStart := f[j].ObjectMeta.CreationTimestamp
-	jFinish := f[j].Status.FinishedAt
-	if iFinish.IsZero() && jFinish.IsZero() {
-		return !iStart.Before(&jStart)
-	}
-	if iFinish.IsZero() && !jFinish.IsZero() {
-		return true
-	}
-	if !iFinish.IsZero() && jFinish.IsZero() {
-		return false
-	}
-	return jFinish.Before(&iFinish)
-}
-
 // workflowStatus returns a human readable inferred workflow status based on workflow phase and conditions
 func workflowStatus(wf *wfv1.Workflow) wfv1.NodePhase {
 	switch wf.Status.Phase {
@@ -230,7 +233,7 @@ func workflowStatus(wf *wfv1.Workflow) wfv1.NodePhase {
 		}
 		return wf.Status.Phase
 	case wfv1.NodeFailed:
-		if util.IsWorkflowTerminated(wf) {
+		if wf.Spec.Shutdown != "" {
 			return "Failed (Terminated)"
 		}
 		return wf.Status.Phase

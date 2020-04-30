@@ -6,9 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+
 	wfv1 "github.com/argoproj/argo/pkg/apis/workflow/v1alpha1"
 	art "github.com/argoproj/argo/workflow/artifacts/artifactory"
-	"github.com/stretchr/testify/assert"
 )
 
 const (
@@ -27,18 +28,18 @@ func TestSaveAndLoad(t *testing.T) {
 
 	// create file to test save
 	lf, err := ioutil.TempFile("", LoadFileName)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	defer os.Remove(lf.Name())
 	// load file with test content
 	content := []byte(fileContent)
 	_, err = lf.Write(content)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	err = lf.Close()
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	// create file to test load
 	sf, err := ioutil.TempFile("", SaveFileName)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	defer os.Remove(sf.Name())
 
 	artL := &wfv1.Artifact{}
@@ -49,10 +50,12 @@ func TestSaveAndLoad(t *testing.T) {
 		Username: Username,
 		Password: Password,
 	}
-	driver.Save(lf.Name(), artL)
-	driver.Load(artL, sf.Name())
+	err = driver.Save(lf.Name(), artL)
+	assert.NoError(t, err)
+	err = driver.Load(artL, sf.Name())
+	assert.NoError(t, err)
 
 	dat, err := ioutil.ReadFile(sf.Name())
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, fileContent, string(dat))
 }

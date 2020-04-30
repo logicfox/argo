@@ -3,6 +3,7 @@ package executor
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	argofile "github.com/argoproj/pkg/file"
 	log "github.com/sirupsen/logrus"
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,14 +35,7 @@ import (
 	"github.com/argoproj/argo/util/archive"
 	"github.com/argoproj/argo/util/retry"
 	artifact "github.com/argoproj/argo/workflow/artifacts"
-	"github.com/argoproj/argo/workflow/artifacts/artifactory"
-	"github.com/argoproj/argo/workflow/artifacts/git"
-	"github.com/argoproj/argo/workflow/artifacts/hdfs"
-	"github.com/argoproj/argo/workflow/artifacts/http"
-	"github.com/argoproj/argo/workflow/artifacts/raw"
-	"github.com/argoproj/argo/workflow/artifacts/s3"
 	"github.com/argoproj/argo/workflow/common"
-	argofile "github.com/argoproj/pkg/file"
 )
 
 const (
@@ -50,8 +45,6 @@ const (
 
 // WorkflowExecutor is program which runs as the init/wait container
 type WorkflowExecutor struct {
-	common.ResourceInterface
-
 	PodName            string
 	Template           wfv1.Template
 	ClientSet          kubernetes.Interface
@@ -77,11 +70,15 @@ type ContainerRuntimeExecutor interface {
 	GetFileContents(containerID string, sourcePath string) (string, error)
 
 	// CopyFile copies a source file in a container to a local path
-	CopyFile(containerID string, sourcePath string, destPath string) error
+	CopyFile(containerID string, sourcePath string, destPath string, compressionLevel int) error
 
 	// GetOutputStream returns the entirety of the container output as a io.Reader
 	// Used to capture script results as an output parameter, and to archive container logs
 	GetOutputStream(containerID string, combinedOutput bool) (io.ReadCloser, error)
+
+	// GetExitCode returns the exit code of the container
+	// Used to capture script exit code as an output parameter
+	GetExitCode(containerID string) (string, error)
 
 	// WaitInit is called before Wait() to signal the executor about an impending Wait call.
 	// For most executors this is a noop, and is only used by the the PNS executor
@@ -136,10 +133,10 @@ func (we *WorkflowExecutor) LoadArtifacts() error {
 				log.Warnf("Ignoring optional artifact '%s' which was not supplied", art.Name)
 				continue
 			} else {
-				return errors.New("required artifact %s not supplied", art.Name)
+				return errors.Errorf("", "required artifact %s not supplied", art.Name)
 			}
 		}
-		artDriver, err := we.InitDriver(art)
+		artDriver, err := we.InitDriver(&art)
 		if err != nil {
 			return err
 		}
@@ -276,12 +273,20 @@ func (we *WorkflowExecutor) saveArtifact(mainCtrID string, art *wfv1.Artifact) e
 			shallowCopy := *we.Template.ArchiveLocation.HDFS
 			art.HDFS = &shallowCopy
 			art.HDFS.Path = path.Join(art.HDFS.Path, fileName)
+		} else if we.Template.ArchiveLocation.OSS != nil {
+			shallowCopy := *we.Template.ArchiveLocation.OSS
+			art.OSS = &shallowCopy
+			art.OSS.Key = path.Join(art.OSS.Key, fileName)
+		} else if we.Template.ArchiveLocation.GCS != nil {
+			shallowCopy := *we.Template.ArchiveLocation.GCS
+			art.GCS = &shallowCopy
+			art.GCS.Key = path.Join(art.GCS.Key, fileName)
 		} else {
 			return errors.Errorf(errors.CodeBadRequest, "Unable to determine path to store %s. Archive location provided no information", art.Name)
 		}
 	}
 
-	artDriver, err := we.InitDriver(*art)
+	artDriver, err := we.InitDriver(art)
 	if err != nil {
 		return err
 	}
@@ -313,6 +318,14 @@ func (we *WorkflowExecutor) stageArchiveFile(mainCtrID string, art *wfv1.Artifac
 			Tar: &wfv1.TarStrategy{},
 		}
 	}
+	compressionLevel := gzip.NoCompression
+	if strategy.Tar != nil {
+		if l := strategy.Tar.CompressionLevel; l != nil {
+			compressionLevel = int(*l)
+		} else {
+			compressionLevel = gzip.DefaultCompression
+		}
+	}
 
 	if !we.isBaseImagePath(art.Path) {
 		// If we get here, we are uploading an artifact from a mirrored volume mount which the wait
@@ -332,7 +345,7 @@ func (we *WorkflowExecutor) stageArchiveFile(mainCtrID string, art *wfv1.Artifac
 			return "", "", errors.InternalWrapError(err)
 		}
 		w := bufio.NewWriter(f)
-		err = archive.TarGzToWriter(mountedArtPath, w)
+		err = archive.TarGzToWriter(mountedArtPath, compressionLevel, w)
 		if err != nil {
 			return "", "", err
 		}
@@ -344,7 +357,7 @@ func (we *WorkflowExecutor) stageArchiveFile(mainCtrID string, art *wfv1.Artifac
 	localArtPath := filepath.Join(tempOutArtDir, fileName)
 	log.Infof("Copying %s from container base image layer to %s", art.Path, localArtPath)
 
-	err := we.RuntimeExecutor.CopyFile(mainCtrID, art.Path, localArtPath)
+	err := we.RuntimeExecutor.CopyFile(mainCtrID, art.Path, localArtPath, compressionLevel)
 	if err != nil {
 		return "", "", err
 	}
@@ -429,14 +442,24 @@ func (we *WorkflowExecutor) SaveParameters() error {
 			log.Infof("Copying %s from base image layer", param.ValueFrom.Path)
 			output, err = we.RuntimeExecutor.GetFileContents(mainCtrID, param.ValueFrom.Path)
 			if err != nil {
-				return err
+				// We have a default value to use instead of returning an error
+				if param.ValueFrom.Default != nil {
+					output = *param.ValueFrom.Default
+				} else {
+					return err
+				}
 			}
 		} else {
 			log.Infof("Copying %s from from volume mount", param.ValueFrom.Path)
 			mountedPath := filepath.Join(common.ExecutorMainFilesystemDir, param.ValueFrom.Path)
 			out, err := ioutil.ReadFile(mountedPath)
 			if err != nil {
-				return err
+				// We have a default value to use instead of returning an error
+				if param.ValueFrom.Default != nil {
+					output = *param.ValueFrom.Default
+				} else {
+					return err
+				}
 			}
 			output = string(out)
 		}
@@ -494,10 +517,14 @@ func (we *WorkflowExecutor) SaveLogs() (*wfv1.Artifact, error) {
 		shallowCopy := *we.Template.ArchiveLocation.HDFS
 		art.HDFS = &shallowCopy
 		art.HDFS.Path = path.Join(art.HDFS.Path, fileName)
+	} else if we.Template.ArchiveLocation.GCS != nil {
+		shallowCopy := *we.Template.ArchiveLocation.GCS
+		art.GCS = &shallowCopy
+		art.GCS.Key = path.Join(art.GCS.Key, fileName)
 	} else {
 		return nil, errors.Errorf(errors.CodeBadRequest, "Unable to determine path to store %s. Archive location provided no information", art.Name)
 	}
-	artDriver, err := we.InitDriver(art)
+	artDriver, err := we.InitDriver(&art)
 	if err != nil {
 		return nil, err
 	}
@@ -509,9 +536,13 @@ func (we *WorkflowExecutor) SaveLogs() (*wfv1.Artifact, error) {
 	return &art, nil
 }
 
-// GetSecretFromVolMount will retrieve the Secrets from VolumeMount
-func (we *WorkflowExecutor) GetSecretFromVolMount(accessKeyName string, accessKey string) ([]byte, error) {
-	return ioutil.ReadFile(filepath.Join(common.SecretVolMountPath, accessKeyName, accessKey))
+// GetSecret will retrieve the Secrets from VolumeMount
+func (we *WorkflowExecutor) GetSecret(accessKeyName string, accessKey string) (string, error) {
+	file, err := ioutil.ReadFile(filepath.Join(common.SecretVolMountPath, accessKeyName, accessKey))
+	if err != nil {
+		return "", err
+	}
+	return string(file), nil
 }
 
 // saveLogToFile saves the entire log output of a container to a local file
@@ -534,89 +565,12 @@ func (we *WorkflowExecutor) saveLogToFile(mainCtrID, path string) error {
 }
 
 // InitDriver initializes an instance of an artifact driver
-func (we *WorkflowExecutor) InitDriver(art wfv1.Artifact) (artifact.ArtifactDriver, error) {
-	if art.S3 != nil {
-		var accessKey string
-		var secretKey string
-
-		if art.S3.AccessKeySecret.Name != "" {
-			accessKeyBytes, err := we.GetSecretFromVolMount(art.S3.AccessKeySecret.Name, art.S3.AccessKeySecret.Key)
-			if err != nil {
-				return nil, err
-			}
-			accessKey = string(accessKeyBytes)
-			secretKeyBytes, err := we.GetSecretFromVolMount(art.S3.SecretKeySecret.Name, art.S3.SecretKeySecret.Key)
-			if err != nil {
-				return nil, err
-			}
-			secretKey = string(secretKeyBytes)
-		}
-
-		driver := s3.S3ArtifactDriver{
-			Endpoint:  art.S3.Endpoint,
-			AccessKey: accessKey,
-			SecretKey: secretKey,
-			Secure:    art.S3.Insecure == nil || !*art.S3.Insecure,
-			Region:    art.S3.Region,
-			RoleARN:   art.S3.RoleARN,
-		}
-		return &driver, nil
+func (we *WorkflowExecutor) InitDriver(art *wfv1.Artifact) (artifact.ArtifactDriver, error) {
+	driver, err := artifact.NewDriver(art, we)
+	if err == artifact.ErrUnsupportedDriver {
+		return nil, errors.Errorf(errors.CodeBadRequest, "Unsupported artifact driver for %s", art.Name)
 	}
-	if art.HTTP != nil {
-		return &http.HTTPArtifactDriver{}, nil
-	}
-	if art.Git != nil {
-		gitDriver := git.GitArtifactDriver{
-			InsecureIgnoreHostKey: art.Git.InsecureIgnoreHostKey,
-		}
-		if art.Git.UsernameSecret != nil {
-			usernameBytes, err := we.GetSecretFromVolMount(art.Git.UsernameSecret.Name, art.Git.UsernameSecret.Key)
-			if err != nil {
-				return nil, err
-			}
-			gitDriver.Username = string(usernameBytes)
-		}
-		if art.Git.PasswordSecret != nil {
-			passwordBytes, err := we.GetSecretFromVolMount(art.Git.PasswordSecret.Name, art.Git.PasswordSecret.Key)
-			if err != nil {
-				return nil, err
-			}
-			gitDriver.Password = string(passwordBytes)
-		}
-		if art.Git.SSHPrivateKeySecret != nil {
-			sshPrivateKeyBytes, err := we.GetSecretFromVolMount(art.Git.SSHPrivateKeySecret.Name, art.Git.SSHPrivateKeySecret.Key)
-			if err != nil {
-				return nil, err
-			}
-			gitDriver.SSHPrivateKey = string(sshPrivateKeyBytes)
-		}
-
-		return &gitDriver, nil
-	}
-	if art.Artifactory != nil {
-		usernameBytes, err := we.GetSecretFromVolMount(art.Artifactory.UsernameSecret.Name, art.Artifactory.UsernameSecret.Key)
-		if err != nil {
-			return nil, err
-		}
-		passwordBytes, err := we.GetSecretFromVolMount(art.Artifactory.PasswordSecret.Name, art.Artifactory.PasswordSecret.Key)
-		if err != nil {
-			return nil, err
-		}
-		driver := artifactory.ArtifactoryArtifactDriver{
-			Username: string(usernameBytes),
-			Password: string(passwordBytes),
-		}
-		return &driver, nil
-
-	}
-	if art.HDFS != nil {
-		return hdfs.CreateDriver(we, art.HDFS)
-	}
-	if art.Raw != nil {
-		return &raw.RawArtifactDriver{}, nil
-	}
-
-	return nil, errors.Errorf(errors.CodeBadRequest, "Unsupported artifact driver for %s", art.Name)
+	return driver, err
 }
 
 // getPod is a wrapper around the pod interface to get the current pod from kube API server
@@ -641,13 +595,9 @@ func (we *WorkflowExecutor) getPod() (*apiv1.Pod, error) {
 	return pod, nil
 }
 
-// GetNamespace returns the namespace
-func (we *WorkflowExecutor) GetNamespace() string {
-	return we.Namespace
-}
-
 // GetConfigMapKey retrieves a configmap value and memoizes the result
-func (we *WorkflowExecutor) GetConfigMapKey(namespace, name, key string) (string, error) {
+func (we *WorkflowExecutor) GetConfigMapKey(name, key string) (string, error) {
+	namespace := we.Namespace
 	cachedKey := fmt.Sprintf("%s/%s/%s", namespace, name, key)
 	if val, ok := we.memoizedConfigMaps[cachedKey]; ok {
 		return val, nil
@@ -753,7 +703,8 @@ func (we *WorkflowExecutor) CaptureScriptResult() error {
 		log.Infof("No Script output reference in workflow. Capturing script output ignored")
 		return nil
 	}
-	if we.Template.Script == nil {
+	if we.Template.Script == nil && we.Template.Container == nil {
+		log.Infof("Template type is neither of Script or Container. Capturing script output ignored")
 		return nil
 	}
 	log.Infof("Capturing script output")
@@ -776,7 +727,37 @@ func (we *WorkflowExecutor) CaptureScriptResult() error {
 	if outputLen > 0 && out[outputLen-1] == '\n' {
 		out = out[0 : outputLen-1]
 	}
+
+	const maxAnnotationSize int = 256 * (1 << 10) // 256 kB
+	// A character in a string is a byte
+	if len(out) > maxAnnotationSize {
+		log.Warnf("Output is larger than the maximum allowed size of 256 kB, only the last 256 kB were saved")
+		out = out[len(out)-maxAnnotationSize:]
+	}
+
 	we.Template.Outputs.Result = &out
+	return nil
+}
+
+// CaptureScriptExitCode will add the exit code of a script template as output exit code
+func (we *WorkflowExecutor) CaptureScriptExitCode() error {
+	if we.Template.Script == nil && we.Template.Container == nil {
+		log.Infof("Template type is neither of Script or Container. Capturing exit code ignored")
+		return nil
+	}
+	log.Infof("Capturing script exit code")
+	mainContainerID, err := we.GetMainContainerID()
+	if err != nil {
+		return err
+	}
+	exitCode, err := we.RuntimeExecutor.GetExitCode(mainContainerID)
+	if err != nil {
+		return err
+	}
+
+	if exitCode != "" {
+		we.Template.Outputs.ExitCode = &exitCode
+	}
 	return nil
 }
 

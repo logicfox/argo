@@ -1,17 +1,21 @@
 package commands
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"time"
 
 	"github.com/argoproj/pkg/errors"
+	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 
+	"github.com/argoproj/argo/cmd/argo/commands/client"
+	workflowpkg "github.com/argoproj/argo/pkg/apiclient/workflow"
+
 	wfv1 "github.com/argoproj/argo/pkg/apis/workflow/v1alpha1"
-	"github.com/argoproj/argo/workflow/util"
+	"github.com/argoproj/argo/workflow/packer"
 )
 
 func NewWatchCommand() *cobra.Command {
@@ -23,45 +27,53 @@ func NewWatchCommand() *cobra.Command {
 				cmd.HelpFunc()(cmd, args)
 				os.Exit(1)
 			}
-			InitWorkflowClient()
 			watchWorkflow(args[0])
+
 		},
 	}
 	return command
 }
 
-func watchWorkflow(name string) {
-	fieldSelector := fields.ParseSelectorOrDie(fmt.Sprintf("metadata.name=%s", name))
-	opts := metav1.ListOptions{
-		FieldSelector: fieldSelector.String(),
+func watchWorkflow(wfName string) {
+
+	ctx, apiClient := client.NewAPIClient()
+	serviceClient := apiClient.NewWorkflowServiceClient()
+	namespace := client.Namespace()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	req := &workflowpkg.WatchWorkflowsRequest{
+		Namespace: namespace,
+		ListOptions: &metav1.ListOptions{
+			FieldSelector: fields.ParseSelectorOrDie(fmt.Sprintf("metadata.name=%s", wfName)).String(),
+		},
 	}
-	wf, err := wfClient.Get(name, metav1.GetOptions{})
+	stream, err := serviceClient.WatchWorkflows(ctx, req)
 	errors.CheckError(err)
-
-	watchIf, err := wfClient.Watch(opts)
-	errors.CheckError(err)
-	ticker := time.NewTicker(time.Second)
-
 	for {
-		select {
-		case next := <-watchIf.ResultChan():
-			wf, _ = next.Object.(*wfv1.Workflow)
-		case <-ticker.C:
-		}
-		if wf == nil {
-			watchIf.Stop()
-			watchIf, err = wfClient.Watch(opts)
-			errors.CheckError(err)
-			continue
-		}
-		err := util.DecompressWorkflow(wf)
+		event, err := stream.Recv()
 		errors.CheckError(err)
-		print("\033[H\033[2J")
-		print("\033[0;0H")
-		printWorkflowHelper(wf, getFlags{})
+		wf := event.Object
+		if wf == nil {
+			log.Debug("Re-establishing workflow watch")
+			stream, err = serviceClient.WatchWorkflows(ctx, req)
+			if err != nil {
+				errors.CheckError(err)
+				return
+			}
+			continue
+
+		}
+		printWorkflowStatus(wf)
 		if !wf.Status.FinishedAt.IsZero() {
 			break
 		}
 	}
-	watchIf.Stop()
+}
+
+func printWorkflowStatus(wf *wfv1.Workflow) {
+	err := packer.DecompressWorkflow(wf)
+	errors.CheckError(err)
+	print("\033[H\033[2J")
+	print("\033[0;0H")
+	printWorkflowHelper(wf, getFlags{})
 }

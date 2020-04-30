@@ -1,64 +1,34 @@
 # Release Instructions
 
-1. Update CHANGELOG.md with changes in the release
+Allow 1h to do a release.
 
-2. Update VERSION with new tag
+## Preparation
 
-3. Update codegen, manifests with new tag
+Cherry-pick your changes from master onto the release branch.
 
-```bash
-make codegen manifests IMAGE_NAMESPACE=argoproj IMAGE_TAG=vX.Y.Z
-```
+The release branch should be green [in CircleCI](https://app.circleci.com/github/argoproj/argo/pipelines) before you start.
 
-4. Commit VERSION and manifest changes
+## Release
 
-```bash
-git add .
-git commit -m "Update version to vX.Y.Z"
-```
+To generate new manifests and perform basic checks:
 
-5. git tag the release
+    make prepare-release VERSION=v2.7.2
 
-```bash
-git tag vX.Y.Z
-```
+Publish the images and local Git changes (disabling K3D as this is faster and more reliable for releases):
 
-6. Build both the controller and UI release
+    make publish-release K3D=false
 
-In argo repo:
-```bash
-make release IMAGE_NAMESPACE=argoproj IMAGE_TAG=vX.Y.Z
-```
+Create [the release](https://github.com/argoproj/argo/releases) in Github. You can get some text for this using [Github Toolkit](https://github.com/alexec/github-toolkit):
 
-In argo-ui repo:
-```bash
-IMAGE_NAMESPACE=argoproj IMAGE_TAG=vX.Y.Z yarn docker
-```
+    ght relnote v2.7.1..v2.7.2
 
-8. If successful, publish the release:
-```bash
-export ARGO_RELEASE=vX.Y.Z
-docker push argoproj/workflow-controller:${ARGO_RELEASE}
-docker push argoproj/argoexec:${ARGO_RELEASE}
-docker push argoproj/argocli:${ARGO_RELEASE}
-docker push argoproj/argoui:${ARGO_RELEASE}
-```
+Release notes checklist:
 
-9. Push commits and tags to git. Run the following in both the argo and argo-ui repos:
+* [ ] All breaking changes are listed with migration steps
+* [ ] The release notes identify every publicly known vulnerability with a CVE assignment 
 
-In argo repo:
-```bash
-git push upstream
-git push upstream ${ARGO_RELEASE}
-git tag stable
-git push upstream stable
-```
+If this is GA:
 
-In argo-ui repo:
-```bash
-git push upstream ${ARGO_RELEASE}
-```
-
-10. Draft GitHub release with the content from CHANGELOG.md, and CLI binaries produced in the `dist` directory
-
-* https://github.com/argoproj/argo/releases/new
+* [ ] Update the `stable` tag
+* [ ] Update the [Homebrew tap](https://github.com/argoproj/homebrew-tap).
+ 

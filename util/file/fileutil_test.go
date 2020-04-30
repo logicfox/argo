@@ -41,12 +41,12 @@ func TestExistsInTar(t *testing.T) {
 			}
 			hdr := tar.Header{Name: f.name, Mode: int64(mode), Size: int64(len(f.body))}
 			err := writer.WriteHeader(&hdr)
-			assert.Nil(t, err)
+			assert.NoError(t, err)
 			_, err = writer.Write([]byte(f.body))
-			assert.Nil(t, err)
+			assert.NoError(t, err)
 		}
 		err := writer.Close()
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		return tar.NewReader(&buf)
 	}
 
@@ -97,16 +97,14 @@ func TestExistsInTar(t *testing.T) {
 			},
 		},
 		{
-			sourcePath: "/empty.txt", expected: false,
+			sourcePath: "/empty.txt", expected: true,
 			files: []fakeFile{
-				// fails because empty.txt is empty
 				{name: "empty.txt", body: ""},
 			},
 		},
 		{
-			sourcePath: "/tmp/empty.txt", expected: false,
+			sourcePath: "/tmp/empty.txt", expected: true,
 			files: []fakeFile{
-				// fails because empty.txt is empty
 				{name: "empty.txt", body: ""},
 			},
 		},
